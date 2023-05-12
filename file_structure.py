@@ -12,5 +12,5 @@ def list_files_and_folders(root_dir, level=0):
             print('  ' * level + entry)
 
 
-root_directory = "../wepromise/backend-service/code/src/main/kotlin"
+root_directory = "/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise"
 list_files_and_folders(root_directory)

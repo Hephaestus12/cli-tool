@@ -27,8 +27,8 @@ def save_file_data(file_data, output_file):
             f.write(filecontent + "\n")
             f.write("\n-----\n\n")
 
-rootdir = "../wepromise/backend-service/code/src/main/kotlin/wepromise/application/btobi"
-output_file = f"../wepromise/application-btobi.txt"
+rootdir = "/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe"
+output_file = f"./payment-stripe.txt"
 
 file_data = traverse(rootdir)
 save_file_data(file_data, output_file)

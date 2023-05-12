@@ -1,0 +1,314 @@
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/payment/aws/PaymentCmdDdbRepository.kt:
+package wepromise.application.finance.payment.aws
+
+import software.amazon.awssdk.enhanced.dynamodb.AttributeConverter
+import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primarySortKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.secondaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticTableSchema
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbBean
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbConvertedBy
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbSecondaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbSortKey
+import wepromise.api.commons.domain.FlowId
+import wepromise.api.finance.payment.PaymentCmd
+import wepromise.api.finance.payment.PaymentCmdId
+import wepromise.api.finance.payment.PaymentCmdRepository
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.commons.aws.ddb.FromStringAttributeConverter
+import wepromise.commons.json.toJson
+
+// FIXME:
+//  1. Make this immutable
+//  2. Create different classes for each type, like request, response, etc.
+//  3. Write integration test
+@DynamoDbBean
+data class PaymentCmdDdbEntity(
+
+    @get:DynamoDbPartitionKey
+    @get:DynamoDbConvertedBy(FlowIdConverter::class)
+    var fid: FlowId = FlowId.generate(),
+
+    @get:DynamoDbSortKey
+    @get:DynamoDbConvertedBy(PaymentCmdIdConverter::class)
+    @get:DynamoDbSecondaryPartitionKey(indexNames = ["id-index"])
+    var cid: PaymentCmdId = PaymentCmdId.generate(),
+
+    var type: PaymentCmd.Type? = null,
+
+    var issuedBy: String = "", // event ID, request ID
+
+    var issuedAt: Long = 0, // epoch milliseconds
+
+    var args: String = "{}", // JSON string
+
+    var issuer: String = "{}", // issuer json string
+)
+
+class PaymentCmdDdbRepository(props: Properties, client: DynamoDbEnhancedClient) : PaymentCmdRepository {
+    private val log = logger()
+
+    private val schema = tableSchema() // TableSchema.fromBean is not NativeImage friendly!
+    private val table = client.table(props.table, schema)
+
+    // FIXME: unit test for the converter
+    override fun insert(c: PaymentCmd) {
+        insert(
+            PaymentCmdDdbEntity(
+                fid = c.flowId,
+                cid = c.id,
+                type = c.type,
+                issuedBy = c.issuedBy,
+                issuedAt = c.issuedAt,
+                args = c.args.toJson(),
+                issuer = c.issuer.toJson(),
+            )
+        )
+    }
+
+    // FIXME: check if the item doesn't already exist!
+    private fun insert(e: PaymentCmdDdbEntity) {
+        log.info("Saving {}", e)
+        table.putItem(e)
+    }
+
+    data class Properties(val table: String)
+}
+
+private fun tableSchema(): StaticTableSchema<PaymentCmdDdbEntity> =
+    StaticTableSchema.builder(PaymentCmdDdbEntity::class.java)
+        .newItemSupplier(::PaymentCmdDdbEntity)
+        .addAttribute(FlowId::class.java) {
+            it.name("fid")
+                .getter(PaymentCmdDdbEntity::fid.getter)
+                .setter(PaymentCmdDdbEntity::fid.setter)
+                .tags(primaryPartitionKey())
+                .attributeConverter(FlowIdConverter())
+        }
+        .addAttribute(PaymentCmdId::class.java) {
+            it.name("cid")
+                .getter(PaymentCmdDdbEntity::cid.getter)
+                .setter(PaymentCmdDdbEntity::cid.setter)
+                .tags(primarySortKey(), secondaryPartitionKey("id-index"))
+                .attributeConverter(PaymentCmdIdConverter())
+        }
+        .addAttribute(PaymentCmd.Type::class.java) {
+            it.name("type")
+                .getter(PaymentCmdDdbEntity::type.getter)
+                .setter(PaymentCmdDdbEntity::type.setter)
+        }
+        .addAttribute(String::class.java) {
+            it.name("issuedBy")
+                .getter(PaymentCmdDdbEntity::issuedBy.getter)
+                .setter(PaymentCmdDdbEntity::issuedBy.setter)
+        }
+        .addAttribute(Long::class.java) {
+            it.name("issuedAt")
+                .getter(PaymentCmdDdbEntity::issuedAt.getter)
+                .setter(PaymentCmdDdbEntity::issuedAt.setter)
+        }
+        .addAttribute(String::class.java) {
+            it.name("args")
+                .getter(PaymentCmdDdbEntity::args.getter)
+                .setter(PaymentCmdDdbEntity::args.setter)
+        }
+        .addAttribute(String::class.java) {
+            it.name("issuer")
+                .getter(PaymentCmdDdbEntity::issuer.getter)
+                .setter(PaymentCmdDdbEntity::issuer.setter)
+        }
+        .build()
+
+class FlowIdConverter : AttributeConverter<FlowId> by
+FromStringAttributeConverter.with(FlowId::toJsonString, FlowId::parse)
+
+class PaymentCmdIdConverter : AttributeConverter<PaymentCmdId> by
+FromStringAttributeConverter.with(PaymentCmdId::toJsonString, PaymentCmdId::parse)
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/payment/aws/PaymentEventDdbRepository.kt:
+package wepromise.application.finance.payment.aws
+
+import com.fasterxml.jackson.databind.node.ObjectNode
+import software.amazon.awssdk.enhanced.dynamodb.AttributeConverter
+import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primarySortKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticTableSchema
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbBean
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbConvertedBy
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbSortKey
+import software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional.keyEqualTo
+import wepromise.api.backend.order.OrderId
+import wepromise.api.commons.domain.FlowId
+import wepromise.api.finance.payment.PaymentCmdId
+import wepromise.api.finance.payment.PaymentEvent
+import wepromise.api.finance.payment.PaymentEventId
+import wepromise.api.finance.payment.PaymentEventRepository
+import wepromise.api.finance.payment.PaymentId
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.commons.aws.ddb.FromStringAttributeConverter
+import wepromise.commons.aws.ddb.ObjectNodeAttributeConverter
+import wepromise.commons.json.JsonHelper
+import wepromise.commons.json.deepCopyToMap
+import wepromise.commons.json.parseJson
+import wepromise.commons.json.toJson
+import wepromise.commons.json.toJsonNode
+import wepromise.commons.lang.UnexpectedException
+
+// FIXME:
+//  1. Make this immutable
+//  2. Create different classes for each type, like request, response, etc.
+//  3. Write integration test
+@DynamoDbBean
+data class PaymentEventDdbEntity(
+
+    @get:DynamoDbPartitionKey
+    @get:DynamoDbConvertedBy(PaymentIdConverter::class)
+    var did: PaymentId = PaymentId.generate(),
+
+    @get:DynamoDbSortKey
+    @get:DynamoDbConvertedBy(PaymentEventIdConverter::class)
+    var eid: PaymentEventId = PaymentEventId.generate(),
+
+    @get:DynamoDbConvertedBy(FlowIdConverter::class)
+    var flowId: FlowId = FlowId.generate(),
+
+    var type: PaymentEvent.Type? = null,
+
+    @get:DynamoDbConvertedBy(PaymentCmdIdConverter::class)
+    var triggeredBy: PaymentCmdId = PaymentCmdId.generate(),
+
+    var triggeredAt: Long = 0, // epoch milliseconds
+
+    @get:DynamoDbConvertedBy(OrderIdConverter::class)
+    var orderId: OrderId = OrderId.generate(),
+
+    @get:DynamoDbConvertedBy(ObjectNodeAttributeConverter::class)
+    var patch: ObjectNode = JsonHelper.emptyObjectNode(), // FIXME: Use AWS SDK ObjectNode
+
+    @get:DynamoDbConvertedBy(ObjectNodeAttributeConverter::class)
+    var snapshot: ObjectNode = JsonHelper.emptyObjectNode(), // FIXME: Use AWS SDK ObjectNode
+)
+
+class PaymentEventDdbRepository(props: Properties, client: DynamoDbEnhancedClient) : PaymentEventRepository {
+    private val log = logger()
+
+    private val schema = tableSchema() // TableSchema.fromBean is not NativeImage friendly!
+    private val table = client.table(props.table, schema)
+
+    // FIXME: unit test for the converter
+    override fun insert(e: PaymentEvent) {
+        insert(
+            PaymentEventDdbEntity(
+                did = e.paymentId,
+                eid = e.id,
+                flowId = e.flowId,
+                type = e.type,
+                triggeredBy = e.triggeredBy,
+                triggeredAt = e.triggeredAt,
+                orderId = e.orderId,
+                patch = e.patch.toJsonNode() as ObjectNode,
+                snapshot = e.snapshot.toJsonNode() as ObjectNode,
+            )
+        )
+    }
+
+    private fun insert(d: PaymentEventDdbEntity) {
+        log.info("Saving {}", d)
+        table.putItem(d)
+    }
+
+    override fun getAll(id: PaymentId): List<PaymentEvent> {
+        log.info("Getting all events for {}", id)
+        val list = table.query(keyEqualTo { k -> k.partitionValue(id.toJsonString()) })
+            .items().map(this::deserializePaymentEvent).sortedBy(PaymentEvent::triggeredAt)
+        log.info("Found {} events for {}", list.size, id)
+        return list
+    }
+
+    // FIXME: maybe read as a ObjectNode
+    private fun deserializePaymentEvent(e: PaymentEventDdbEntity): PaymentEvent {
+        val map = e.deepCopyToMap().toMutableMap()
+        map["paymentId"] = map.remove("did") ?: throw UnexpectedException("domain id is missing")
+        return map.toJson().parseJson()
+    }
+
+    data class Properties(val table: String)
+}
+
+private fun tableSchema(): StaticTableSchema<PaymentEventDdbEntity> {
+    return StaticTableSchema.builder(PaymentEventDdbEntity::class.java)
+        .newItemSupplier(::PaymentEventDdbEntity)
+        .addAttribute(PaymentId::class.java) {
+            it.name("did")
+                .getter(PaymentEventDdbEntity::did.getter)
+                .setter(PaymentEventDdbEntity::did.setter)
+                .tags(primaryPartitionKey())
+                .attributeConverter(PaymentIdConverter())
+        }
+        .addAttribute(PaymentEventId::class.java) {
+            it.name("eid")
+                .getter(PaymentEventDdbEntity::eid.getter)
+                .setter(PaymentEventDdbEntity::eid.setter)
+                .tags(primarySortKey())
+                .attributeConverter(PaymentEventIdConverter())
+        }
+        .addAttribute(FlowId::class.java) {
+            it.name("flowId")
+                .getter(PaymentEventDdbEntity::flowId.getter)
+                .setter(PaymentEventDdbEntity::flowId.setter)
+                .attributeConverter(FlowIdConverter())
+        }
+        .addAttribute(PaymentEvent.Type::class.java) {
+            it.name("type")
+                .getter(PaymentEventDdbEntity::type.getter)
+                .setter(PaymentEventDdbEntity::type.setter)
+        }
+        .addAttribute(PaymentCmdId::class.java) {
+            it.name("triggeredBy")
+                .getter(PaymentEventDdbEntity::triggeredBy.getter)
+                .setter(PaymentEventDdbEntity::triggeredBy.setter)
+                .attributeConverter(PaymentCmdIdConverter())
+        }
+        .addAttribute(Long::class.java) {
+            it.name("triggeredAt")
+                .getter(PaymentEventDdbEntity::triggeredAt.getter)
+                .setter(PaymentEventDdbEntity::triggeredAt.setter)
+        }
+        .addAttribute(OrderId::class.java) {
+            it.name("orderId")
+                .getter(PaymentEventDdbEntity::orderId.getter)
+                .setter(PaymentEventDdbEntity::orderId.setter)
+                .attributeConverter(OrderIdConverter())
+        }
+        .addAttribute(ObjectNode::class.java) {
+            it.name("patch")
+                .getter(PaymentEventDdbEntity::patch.getter)
+                .setter(PaymentEventDdbEntity::patch.setter)
+                .attributeConverter(ObjectNodeAttributeConverter.INSTANCE)
+        }
+        .addAttribute(ObjectNode::class.java) {
+            it.name("snapshot")
+                .getter(PaymentEventDdbEntity::snapshot.getter)
+                .setter(PaymentEventDdbEntity::snapshot.setter)
+                .attributeConverter(ObjectNodeAttributeConverter.INSTANCE)
+        }
+        .build()
+}
+
+class PaymentIdConverter : AttributeConverter<PaymentId> by
+FromStringAttributeConverter.with(PaymentId::toJsonString, PaymentId::parse)
+
+class OrderIdConverter : AttributeConverter<OrderId> by
+FromStringAttributeConverter.with(OrderId::toJsonString, OrderId::parse)
+
+class PaymentEventIdConverter : AttributeConverter<PaymentEventId> by
+FromStringAttributeConverter.with(PaymentEventId::toJsonString, PaymentEventId::parse)
+
+-----
+

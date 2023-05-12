@@ -1,0 +1,1283 @@
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/payment/TransactionService.kt:
+package wepromise.application.finance.payment
+
+import org.joda.money.Money
+import wepromise.api.backend.order.OrderId
+import wepromise.api.commons.domain.FlowId
+import wepromise.api.finance.payment.PaymentId
+import wepromise.api.finance.payment.StartedTransaction
+
+// FIXME: make this a type! at most 12 characters!
+typealias Reference = String
+
+data class CreatePaymentTransactionReq(
+    val flowId: FlowId,
+    val paymentId: PaymentId,
+    val orderId: OrderId,
+    val amount: Money,
+    val reference: Reference,
+    val description: String, // FIXME: make it a type!
+    // val amount: Long, // FIXME: create UnscaledAmount!
+    // val currency: CurrencyUnit,
+)
+
+data class CreatePaymentTransactionRes(val transaction: StartedTransaction)
+
+interface TransactionService {
+    fun createPaymentTransaction(r: CreatePaymentTransactionReq): CreatePaymentTransactionRes
+}
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/payment/PaymentEventListener.kt:
+package wepromise.application.finance.payment
+
+import org.springframework.context.event.EventListener
+import org.springframework.stereotype.Component
+import wepromise.api.finance.payment.PaymentEvent
+import wepromise.commons.LoggerExtensions.logger
+
+interface PaymentEventListener {
+    fun onEvent(e: PaymentEvent)
+}
+
+@Component
+internal class PaymentEventListenerImpl : PaymentEventListener {
+    private val log = logger()
+
+    @EventListener(PaymentEvent::class)
+    override fun onEvent(e: PaymentEvent) {
+        log.info("Handling {}", e)
+    }
+}
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/payment/PaymentService.kt:
+package wepromise.application.finance.payment
+
+import org.springframework.context.event.EventListener
+import org.springframework.stereotype.Service
+import wepromise.api.commons.domain.EventId
+import wepromise.api.commons.domain.FlowId
+import wepromise.api.commons.domain.HttpCmdRequest
+import wepromise.api.finance.payment.CanceledTransaction
+import wepromise.api.finance.payment.CreatePaymentCmd
+import wepromise.api.finance.payment.EmptyPayment
+import wepromise.api.finance.payment.FailedTransaction
+import wepromise.api.finance.payment.MarkSucceededPaymentCmd
+import wepromise.api.finance.payment.PaymentCmdRepository
+import wepromise.api.finance.payment.PaymentCreatedEvent
+import wepromise.api.finance.payment.PaymentEventPublisher
+import wepromise.api.finance.payment.PaymentEventRepository
+import wepromise.api.finance.payment.PaymentId
+import wepromise.api.finance.payment.PaymentUpdatedEvent
+import wepromise.api.finance.payment.StartPaymentCmd
+import wepromise.api.finance.payment.StartedPayment
+import wepromise.api.finance.payment.StartedTransaction
+import wepromise.api.finance.payment.SucceededTransaction
+import wepromise.api.finance.payment.Transaction
+import wepromise.api.finance.payment.UpdatePaymentTransactionCmd
+import wepromise.api.finance.payment.createPayment
+import wepromise.api.finance.payment.http.v1.StartPaymentReq
+import wepromise.api.finance.payment.markSucceededPayment
+import wepromise.api.finance.payment.startPayment
+import wepromise.application.commons.event.EventCmdRequest
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.commons.json.deepCopyToMap
+import wepromise.commons.money.MoneyExtensions.payableAmount
+
+interface PaymentService {
+    /**
+     * Create a payment and start a transaction right away!
+     */
+    fun start(r: HttpCmdRequest<StartPaymentReq>): StartedPayment
+    fun handle(e: EventCmdRequest<ExternalTransactionUpdatedEvent>)
+}
+
+@Service
+internal class PaymentServiceImpl(
+    private val transactions: TransactionService,
+    private val commandRepository: PaymentCmdRepository,
+    private val eventRepository: PaymentEventRepository,
+    private val eventPublisher: PaymentEventPublisher,
+) : PaymentService {
+    private val log = logger()
+
+    override fun start(r: HttpCmdRequest<StartPaymentReq>): StartedPayment {
+        log.info("Starting payment: {}", r)
+
+        val emptyPayment = EmptyPayment.new(r.body.order)
+
+        val cmd = CreatePaymentCmd.from(r)
+        commandRepository.insert(cmd)
+
+        val event = createPayment(emptyPayment, cmd)
+        eventRepository.insert(event)
+        eventPublisher.publish(event)
+
+        val transaction = createPaymentTransaction(event)
+
+        // Ideally we want to update the payment in Stripe "created" event,
+        // but here we need the client-token form Stripe to return to the client.
+
+        val cmd2 = StartPaymentCmd.with(r, event.snapshot.id, transaction)
+        commandRepository.insert(cmd2)
+
+        val event2 = startPayment(event.snapshot, cmd2)
+        eventRepository.insert(event2)
+        eventPublisher.publish(event2)
+
+        return event2.snapshot
+    }
+
+    private fun createPaymentTransaction(e: PaymentCreatedEvent): StartedTransaction {
+        val p = e.snapshot
+        val reference = "WP-" + p.order.number.value
+        val description = "Payment for WeatherPromise order $reference"
+        val r = CreatePaymentTransactionReq(e.flowId, p.id, p.order.id, p.amount, reference, description)
+        return transactions.createPaymentTransaction(r).transaction
+    }
+
+    @EventListener
+    override fun handle(e: EventCmdRequest<ExternalTransactionUpdatedEvent>) {
+        log.info("Handling event: {}", e)
+
+        when (val tx = e.body.transaction) {
+            is StartedTransaction -> handle(e, tx)
+            is SucceededTransaction -> handle(e, tx)
+            is CanceledTransaction -> handle(e, tx)
+            is FailedTransaction -> handle(e, tx)
+        }
+    }
+
+    private fun handle(ee: EventCmdRequest<ExternalTransactionUpdatedEvent>, tx: StartedTransaction) {
+        val paymentId = ee.body.paymentId
+        val events = eventRepository.getAll(paymentId)
+        val event = events.last() // FIXME rebuild the final state from the events!
+        val txs = event.snapshot.transactions().associateBy { it.id }
+
+        val oldTx = txs[tx.id]
+        check(oldTx != null) { "Transaction ${tx.id} not found in payment $paymentId" }
+
+        // This assumes the transaction is started in the same flow as the payment.
+        if (oldTx is StartedTransaction) {
+            log.info("Transaction {} already started", oldTx.id)
+        } else {
+            log.warn("Unexpected HandleTransactionStartedEventReq {} with old state {})", tx.id, oldTx)
+        }
+    }
+
+    private fun handle(ee: EventCmdRequest<ExternalTransactionUpdatedEvent>, tx: SucceededTransaction) {
+        val paymentId = ee.body.paymentId
+        val events = eventRepository.getAll(paymentId)
+        val event = events.last() // FIXME rebuild the final state from the events!
+        val txs = event.snapshot.transactions().associateBy { it.id }
+
+        val oldTx = txs[tx.id]
+        check(oldTx != null) { "Transaction ${tx.id} not found in payment $paymentId" }
+
+        if (oldTx is SucceededTransaction) {
+            log.info("Transaction {} already started", oldTx.id)
+        } else if (oldTx.state.terminal()) {
+            throw IllegalStateException("Unexpected HandleTransactionSucceededEventReq ${tx.id} with old state $oldTx")
+        }
+
+        val cmd = UpdatePaymentTransactionCmd.from(ee.flowId, ee.eventId, paymentId, tx, ee)
+        commandRepository.insert(cmd)
+
+        val snapshot = StartedPayment.with(event.snapshot as StartedPayment, cmd)
+        val e = PaymentUpdatedEvent.with(cmd, snapshot)
+        eventRepository.insert(e)
+        eventPublisher.publish(e)
+        concludePayment(e)
+    }
+
+    private fun handle(ee: EventCmdRequest<ExternalTransactionUpdatedEvent>, tx: CanceledTransaction) {
+        val paymentId = ee.body.paymentId
+        val events = eventRepository.getAll(paymentId)
+        val event = events.last() // FIXME rebuild the final state from the events!
+        val txs = event.snapshot.transactions().associateBy { it.id }
+
+        val oldTx = if (txs.containsKey(tx.id)) txs.getValue(tx.id) else {
+            log.warn("Transaction ${tx.id} not found in payment $paymentId")
+            StartedTransaction(tx.id, tx.amountRequested, 0, tx.currency, tx.startedAt, null)
+        }
+
+        if (oldTx is CanceledTransaction) {
+            log.info("Transaction {} already started", oldTx.id)
+        } else if (oldTx.state.terminal()) {
+            log.warn("Unexpected HandleTransactionCanceledEventReq {} with old state {})", tx.id, oldTx)
+        } else {
+            val cmd = UpdatePaymentTransactionCmd.from(ee.flowId, ee.eventId, paymentId, tx, ee)
+            commandRepository.insert(cmd)
+
+            // FIXME: how to use CancelPayment?
+            val snapshot = StartedPayment.with(event.snapshot as StartedPayment, cmd)
+            val e = PaymentUpdatedEvent.with(cmd, snapshot)
+            eventRepository.insert(e)
+            eventPublisher.publish(e)
+            concludePayment(e)
+        }
+    }
+
+    private fun handle(ee: EventCmdRequest<ExternalTransactionUpdatedEvent>, tx: FailedTransaction) {
+        val paymentId = ee.body.paymentId
+        val events = eventRepository.getAll(paymentId)
+        val event = events.last() // FIXME rebuild the final state from the events!
+        val txs = event.snapshot.transactions().associateBy { it.id }
+
+        val oldTx = if (txs.containsKey(tx.id)) txs.getValue(tx.id) else {
+            log.warn("Transaction ${tx.id} not found in payment $paymentId")
+            StartedTransaction(tx.id, tx.amountRequested, 0, tx.currency, tx.startedAt, null)
+        }
+
+        if (oldTx is FailedTransaction) {
+            log.info("Transaction {} already started", oldTx.id)
+        } else if (oldTx.state.terminal()) {
+            log.warn("Unexpected HandleTransactionCanceledEventReq {} with old state {})", tx.id, oldTx)
+        } else {
+            val cmd = UpdatePaymentTransactionCmd.from(ee.flowId, ee.eventId, paymentId, tx, ee)
+            commandRepository.insert(cmd)
+
+            // FIXME: how to use FailedPayment?
+            val snapshot = StartedPayment.with(event.snapshot as StartedPayment, cmd)
+            val e = PaymentUpdatedEvent.with(cmd, snapshot)
+            eventRepository.insert(e)
+            eventPublisher.publish(e)
+            concludePayment(e)
+        }
+    }
+
+    private fun concludePayment(e: PaymentUpdatedEvent) {
+        assert(e.snapshot.completed == false)
+        val payment = e.snapshot
+        val succeededTransactions = payment.transactions
+            .associateBy { it.id } // to make sure there's no duplicate!
+            .filter { it.value is SucceededTransaction }
+            .map { it.value as SucceededTransaction }
+
+        val amountReceived = succeededTransactions
+            .map { it.amountReceived }
+            .sumOf { it }
+
+        val payable = payment.amount.payableAmount.unscaledValue()
+        if (payable.longValueExact() > amountReceived) {
+            log.info("Payment ${payment.id} is not completed yet: $payable > $amountReceived")
+            return
+        }
+
+        // FIXME: what is the right way?
+        val tx = succeededTransactions.first()
+
+        val cmd2 = MarkSucceededPaymentCmd.with(e, tx.billing)
+        commandRepository.insert(cmd2)
+
+        val event = markSucceededPayment(payment, cmd2)
+        eventRepository.insert(event)
+        eventPublisher.publish(event)
+    }
+
+}
+
+private fun UpdatePaymentTransactionCmd.Companion.from(
+    fid: FlowId,
+    eid: EventId,
+    pid: PaymentId,
+    tx: Transaction,
+    issuer: Any
+) = UpdatePaymentTransactionCmd(
+    flowId = fid,
+    issuedBy = eid.toJsonString(),
+    issuer = issuer.deepCopyToMap(),
+    args = UpdatePaymentTransactionCmd.Args(pid, tx),
+)
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/payment/PaymentEventCmdHandler.kt:
+package wepromise.application.finance.payment
+
+import wepromise.api.finance.payment.PaymentId
+import wepromise.api.finance.payment.Transaction
+import wepromise.application.commons.event.EventCmdRequest
+
+
+// region ExternalTransactionUpdatedEvent
+// Published by the payment gateway (stripe) when a transaction is updated.
+data class ExternalTransactionUpdatedEvent(
+    val paymentId: PaymentId,
+    val transaction: Transaction,
+)
+// endregion
+
+interface PaymentEventCmdHandler {
+    fun handle(r: EventCmdRequest<ExternalTransactionUpdatedEvent>)
+}
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/payment/PaymentEventPublisher.kt:
+package wepromise.application.finance.payment
+
+import org.springframework.context.ApplicationEventPublisher
+import org.springframework.stereotype.Service
+import wepromise.api.finance.payment.PaymentEvent
+import wepromise.api.finance.payment.PaymentEventPublisher
+import wepromise.application.commons.event.EventCmdRequest
+import wepromise.commons.LoggerExtensions.logger
+
+
+@Service
+class PaymentEventPublisherImpl(private val publisher: ApplicationEventPublisher) :
+    PaymentEventPublisher, PaymentEventCmdHandler {
+    private val log = logger()
+
+    override fun publish(e: PaymentEvent) {
+        log.info("Publishing {}", e)
+        publisher.publishEvent(e)
+    }
+
+    override fun handle(r: EventCmdRequest<ExternalTransactionUpdatedEvent>) {
+        log.info("Publishing {}", r)
+        publisher.publishEvent(r)
+    }
+}
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/payment/http/v1/PaymentController.kt:
+package wepromise.application.finance.payment.http.v1
+
+import jakarta.servlet.http.HttpServletRequest
+import org.springframework.http.ResponseEntity
+import org.springframework.web.bind.annotation.PostMapping
+import org.springframework.web.bind.annotation.RequestBody
+import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.RestController
+import wepromise.api.commons.http.HttpResponse
+import wepromise.api.commons.http.toHttpCmdRequest
+import wepromise.api.finance.payment.http.v1.BASE_URL
+import wepromise.api.finance.payment.http.v1.StartPaymentReq
+import wepromise.api.finance.payment.http.v1.StartPaymentRes
+import wepromise.application.finance.payment.PaymentService
+import wepromise.commons.LoggerExtensions.logger
+
+
+@RestController
+@RequestMapping(BASE_URL)
+class PaymentController(
+    private val paymentService: PaymentService,
+) {
+    private val log = logger()
+
+    @PostMapping("/start.rpc")
+    fun startPayment(
+        @RequestBody b: StartPaymentReq,
+        req: HttpServletRequest
+    ): ResponseEntity<out HttpResponse<StartPaymentRes>> {
+        log.info("Starting payment: {}", b)
+
+        val payment = paymentService.start(req.toHttpCmdRequest(b))
+
+        val res = HttpResponse.ok(StartPaymentRes.from(payment))
+
+        return res.toResponseEntity()
+    }
+
+}
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/payment/aws/PaymentCmdDdbRepository.kt:
+package wepromise.application.finance.payment.aws
+
+import software.amazon.awssdk.enhanced.dynamodb.AttributeConverter
+import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primarySortKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.secondaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticTableSchema
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbBean
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbConvertedBy
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbSecondaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbSortKey
+import wepromise.api.commons.domain.FlowId
+import wepromise.api.finance.payment.PaymentCmd
+import wepromise.api.finance.payment.PaymentCmdId
+import wepromise.api.finance.payment.PaymentCmdRepository
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.commons.aws.ddb.FromStringAttributeConverter
+import wepromise.commons.json.toJson
+
+// FIXME:
+//  1. Make this immutable
+//  2. Create different classes for each type, like request, response, etc.
+//  3. Write integration test
+@DynamoDbBean
+data class PaymentCmdDdbEntity(
+
+    @get:DynamoDbPartitionKey
+    @get:DynamoDbConvertedBy(FlowIdConverter::class)
+    var fid: FlowId = FlowId.generate(),
+
+    @get:DynamoDbSortKey
+    @get:DynamoDbConvertedBy(PaymentCmdIdConverter::class)
+    @get:DynamoDbSecondaryPartitionKey(indexNames = ["id-index"])
+    var cid: PaymentCmdId = PaymentCmdId.generate(),
+
+    var type: PaymentCmd.Type? = null,
+
+    var issuedBy: String = "", // event ID, request ID
+
+    var issuedAt: Long = 0, // epoch milliseconds
+
+    var args: String = "{}", // JSON string
+
+    var issuer: String = "{}", // issuer json string
+)
+
+class PaymentCmdDdbRepository(props: Properties, client: DynamoDbEnhancedClient) : PaymentCmdRepository {
+    private val log = logger()
+
+    private val schema = tableSchema() // TableSchema.fromBean is not NativeImage friendly!
+    private val table = client.table(props.table, schema)
+
+    // FIXME: unit test for the converter
+    override fun insert(c: PaymentCmd) {
+        insert(
+            PaymentCmdDdbEntity(
+                fid = c.flowId,
+                cid = c.id,
+                type = c.type,
+                issuedBy = c.issuedBy,
+                issuedAt = c.issuedAt,
+                args = c.args.toJson(),
+                issuer = c.issuer.toJson(),
+            )
+        )
+    }
+
+    // FIXME: check if the item doesn't already exist!
+    private fun insert(e: PaymentCmdDdbEntity) {
+        log.info("Saving {}", e)
+        table.putItem(e)
+    }
+
+    data class Properties(val table: String)
+}
+
+private fun tableSchema(): StaticTableSchema<PaymentCmdDdbEntity> =
+    StaticTableSchema.builder(PaymentCmdDdbEntity::class.java)
+        .newItemSupplier(::PaymentCmdDdbEntity)
+        .addAttribute(FlowId::class.java) {
+            it.name("fid")
+                .getter(PaymentCmdDdbEntity::fid.getter)
+                .setter(PaymentCmdDdbEntity::fid.setter)
+                .tags(primaryPartitionKey())
+                .attributeConverter(FlowIdConverter())
+        }
+        .addAttribute(PaymentCmdId::class.java) {
+            it.name("cid")
+                .getter(PaymentCmdDdbEntity::cid.getter)
+                .setter(PaymentCmdDdbEntity::cid.setter)
+                .tags(primarySortKey(), secondaryPartitionKey("id-index"))
+                .attributeConverter(PaymentCmdIdConverter())
+        }
+        .addAttribute(PaymentCmd.Type::class.java) {
+            it.name("type")
+                .getter(PaymentCmdDdbEntity::type.getter)
+                .setter(PaymentCmdDdbEntity::type.setter)
+        }
+        .addAttribute(String::class.java) {
+            it.name("issuedBy")
+                .getter(PaymentCmdDdbEntity::issuedBy.getter)
+                .setter(PaymentCmdDdbEntity::issuedBy.setter)
+        }
+        .addAttribute(Long::class.java) {
+            it.name("issuedAt")
+                .getter(PaymentCmdDdbEntity::issuedAt.getter)
+                .setter(PaymentCmdDdbEntity::issuedAt.setter)
+        }
+        .addAttribute(String::class.java) {
+            it.name("args")
+                .getter(PaymentCmdDdbEntity::args.getter)
+                .setter(PaymentCmdDdbEntity::args.setter)
+        }
+        .addAttribute(String::class.java) {
+            it.name("issuer")
+                .getter(PaymentCmdDdbEntity::issuer.getter)
+                .setter(PaymentCmdDdbEntity::issuer.setter)
+        }
+        .build()
+
+class FlowIdConverter : AttributeConverter<FlowId> by
+FromStringAttributeConverter.with(FlowId::toJsonString, FlowId::parse)
+
+class PaymentCmdIdConverter : AttributeConverter<PaymentCmdId> by
+FromStringAttributeConverter.with(PaymentCmdId::toJsonString, PaymentCmdId::parse)
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/payment/aws/PaymentEventDdbRepository.kt:
+package wepromise.application.finance.payment.aws
+
+import com.fasterxml.jackson.databind.node.ObjectNode
+import software.amazon.awssdk.enhanced.dynamodb.AttributeConverter
+import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primarySortKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticTableSchema
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbBean
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbConvertedBy
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbSortKey
+import software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional.keyEqualTo
+import wepromise.api.backend.order.OrderId
+import wepromise.api.commons.domain.FlowId
+import wepromise.api.finance.payment.PaymentCmdId
+import wepromise.api.finance.payment.PaymentEvent
+import wepromise.api.finance.payment.PaymentEventId
+import wepromise.api.finance.payment.PaymentEventRepository
+import wepromise.api.finance.payment.PaymentId
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.commons.aws.ddb.FromStringAttributeConverter
+import wepromise.commons.aws.ddb.ObjectNodeAttributeConverter
+import wepromise.commons.json.JsonHelper
+import wepromise.commons.json.deepCopyToMap
+import wepromise.commons.json.parseJson
+import wepromise.commons.json.toJson
+import wepromise.commons.json.toJsonNode
+import wepromise.commons.lang.UnexpectedException
+
+// FIXME:
+//  1. Make this immutable
+//  2. Create different classes for each type, like request, response, etc.
+//  3. Write integration test
+@DynamoDbBean
+data class PaymentEventDdbEntity(
+
+    @get:DynamoDbPartitionKey
+    @get:DynamoDbConvertedBy(PaymentIdConverter::class)
+    var did: PaymentId = PaymentId.generate(),
+
+    @get:DynamoDbSortKey
+    @get:DynamoDbConvertedBy(PaymentEventIdConverter::class)
+    var eid: PaymentEventId = PaymentEventId.generate(),
+
+    @get:DynamoDbConvertedBy(FlowIdConverter::class)
+    var flowId: FlowId = FlowId.generate(),
+
+    var type: PaymentEvent.Type? = null,
+
+    @get:DynamoDbConvertedBy(PaymentCmdIdConverter::class)
+    var triggeredBy: PaymentCmdId = PaymentCmdId.generate(),
+
+    var triggeredAt: Long = 0, // epoch milliseconds
+
+    @get:DynamoDbConvertedBy(OrderIdConverter::class)
+    var orderId: OrderId = OrderId.generate(),
+
+    @get:DynamoDbConvertedBy(ObjectNodeAttributeConverter::class)
+    var patch: ObjectNode = JsonHelper.emptyObjectNode(), // FIXME: Use AWS SDK ObjectNode
+
+    @get:DynamoDbConvertedBy(ObjectNodeAttributeConverter::class)
+    var snapshot: ObjectNode = JsonHelper.emptyObjectNode(), // FIXME: Use AWS SDK ObjectNode
+)
+
+class PaymentEventDdbRepository(props: Properties, client: DynamoDbEnhancedClient) : PaymentEventRepository {
+    private val log = logger()
+
+    private val schema = tableSchema() // TableSchema.fromBean is not NativeImage friendly!
+    private val table = client.table(props.table, schema)
+
+    // FIXME: unit test for the converter
+    override fun insert(e: PaymentEvent) {
+        insert(
+            PaymentEventDdbEntity(
+                did = e.paymentId,
+                eid = e.id,
+                flowId = e.flowId,
+                type = e.type,
+                triggeredBy = e.triggeredBy,
+                triggeredAt = e.triggeredAt,
+                orderId = e.orderId,
+                patch = e.patch.toJsonNode() as ObjectNode,
+                snapshot = e.snapshot.toJsonNode() as ObjectNode,
+            )
+        )
+    }
+
+    private fun insert(d: PaymentEventDdbEntity) {
+        log.info("Saving {}", d)
+        table.putItem(d)
+    }
+
+    override fun getAll(id: PaymentId): List<PaymentEvent> {
+        log.info("Getting all events for {}", id)
+        val list = table.query(keyEqualTo { k -> k.partitionValue(id.toJsonString()) })
+            .items().map(this::deserializePaymentEvent).sortedBy(PaymentEvent::triggeredAt)
+        log.info("Found {} events for {}", list.size, id)
+        return list
+    }
+
+    // FIXME: maybe read as a ObjectNode
+    private fun deserializePaymentEvent(e: PaymentEventDdbEntity): PaymentEvent {
+        val map = e.deepCopyToMap().toMutableMap()
+        map["paymentId"] = map.remove("did") ?: throw UnexpectedException("domain id is missing")
+        return map.toJson().parseJson()
+    }
+
+    data class Properties(val table: String)
+}
+
+private fun tableSchema(): StaticTableSchema<PaymentEventDdbEntity> {
+    return StaticTableSchema.builder(PaymentEventDdbEntity::class.java)
+        .newItemSupplier(::PaymentEventDdbEntity)
+        .addAttribute(PaymentId::class.java) {
+            it.name("did")
+                .getter(PaymentEventDdbEntity::did.getter)
+                .setter(PaymentEventDdbEntity::did.setter)
+                .tags(primaryPartitionKey())
+                .attributeConverter(PaymentIdConverter())
+        }
+        .addAttribute(PaymentEventId::class.java) {
+            it.name("eid")
+                .getter(PaymentEventDdbEntity::eid.getter)
+                .setter(PaymentEventDdbEntity::eid.setter)
+                .tags(primarySortKey())
+                .attributeConverter(PaymentEventIdConverter())
+        }
+        .addAttribute(FlowId::class.java) {
+            it.name("flowId")
+                .getter(PaymentEventDdbEntity::flowId.getter)
+                .setter(PaymentEventDdbEntity::flowId.setter)
+                .attributeConverter(FlowIdConverter())
+        }
+        .addAttribute(PaymentEvent.Type::class.java) {
+            it.name("type")
+                .getter(PaymentEventDdbEntity::type.getter)
+                .setter(PaymentEventDdbEntity::type.setter)
+        }
+        .addAttribute(PaymentCmdId::class.java) {
+            it.name("triggeredBy")
+                .getter(PaymentEventDdbEntity::triggeredBy.getter)
+                .setter(PaymentEventDdbEntity::triggeredBy.setter)
+                .attributeConverter(PaymentCmdIdConverter())
+        }
+        .addAttribute(Long::class.java) {
+            it.name("triggeredAt")
+                .getter(PaymentEventDdbEntity::triggeredAt.getter)
+                .setter(PaymentEventDdbEntity::triggeredAt.setter)
+        }
+        .addAttribute(OrderId::class.java) {
+            it.name("orderId")
+                .getter(PaymentEventDdbEntity::orderId.getter)
+                .setter(PaymentEventDdbEntity::orderId.setter)
+                .attributeConverter(OrderIdConverter())
+        }
+        .addAttribute(ObjectNode::class.java) {
+            it.name("patch")
+                .getter(PaymentEventDdbEntity::patch.getter)
+                .setter(PaymentEventDdbEntity::patch.setter)
+                .attributeConverter(ObjectNodeAttributeConverter.INSTANCE)
+        }
+        .addAttribute(ObjectNode::class.java) {
+            it.name("snapshot")
+                .getter(PaymentEventDdbEntity::snapshot.getter)
+                .setter(PaymentEventDdbEntity::snapshot.setter)
+                .attributeConverter(ObjectNodeAttributeConverter.INSTANCE)
+        }
+        .build()
+}
+
+class PaymentIdConverter : AttributeConverter<PaymentId> by
+FromStringAttributeConverter.with(PaymentId::toJsonString, PaymentId::parse)
+
+class OrderIdConverter : AttributeConverter<OrderId> by
+FromStringAttributeConverter.with(OrderId::toJsonString, OrderId::parse)
+
+class PaymentEventIdConverter : AttributeConverter<PaymentEventId> by
+FromStringAttributeConverter.with(PaymentEventId::toJsonString, PaymentEventId::parse)
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/StripeClient.kt:
+package wepromise.application.finance.stripe
+
+import com.stripe.Stripe
+import com.stripe.model.Charge
+import com.stripe.model.Event
+import com.stripe.model.PaymentIntent
+import com.stripe.net.ApiResource
+import com.stripe.net.Webhook
+import com.stripe.param.PaymentIntentCreateParams
+import com.stripe.param.PaymentIntentRetrieveParams
+import java.net.URL
+import wepromise.api.commons.domain.Secret
+import wepromise.commons.LoggerExtensions.logger
+
+private const val TOLERANCE: Long = 300
+
+fun interface StripeSignatureVerifier {
+    fun verify(payload: String, signature: String) // throws SignatureVerificationException
+
+    companion object {
+        private val log = logger()
+
+        @JvmStatic
+        fun withWebhookSecret(secret: String) = StripeSignatureVerifier { p, s ->
+            Webhook.Signature.verifyHeader(p, s, secret, TOLERANCE)
+        }
+
+        @JvmStatic
+        fun noop() = StripeSignatureVerifier { _, _ -> log.warn("Skipping signature verification!") }
+    }
+}
+
+interface StripeClient {
+    fun createPaymentIntent(params: PaymentIntentCreateParams): PaymentIntent
+    fun retrievePaymentIntent(id: StripePaymentIntentId): PaymentIntent
+    fun retrieveCharge(id: StripeChargeId): Charge
+    fun constructWebhookEvent(payload: String, signature: String): Event
+
+    companion object {
+        @JvmStatic
+        fun create(apiBase: URL, apiKey: Secret, verifier: StripeSignatureVerifier): StripeClient {
+            return StripeClientImpl(apiBase, apiKey.value, verifier)
+        }
+    }
+}
+
+internal class StripeClientImpl(
+    apiBase: URL,
+    apiKey: String,
+    private val verifier: StripeSignatureVerifier,
+) : StripeClient {
+
+    init {
+        Stripe.apiKey = apiKey
+        Stripe.overrideApiBase(apiBase.toString())
+    }
+
+    override fun createPaymentIntent(params: PaymentIntentCreateParams): PaymentIntent {
+        return PaymentIntent.create(params)
+    }
+
+    override fun retrievePaymentIntent(id: StripePaymentIntentId): PaymentIntent {
+        val params = PaymentIntentRetrieveParams.builder().addExpand("latest_charge").build()
+        return PaymentIntent.retrieve(id.value, params, null)
+    }
+
+    override fun retrieveCharge(id: StripeChargeId): Charge {
+        return Charge.retrieve(id.value)
+    }
+
+    override fun constructWebhookEvent(payload: String, signature: String): Event {
+        verifier.verify(payload, signature)
+        return ApiResource.GSON.fromJson(payload, Event::class.java)
+    }
+
+}
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/StripeEvent.kt:
+package wepromise.application.finance.stripe
+
+import com.fasterxml.jackson.annotation.JsonCreator
+import com.stripe.model.Event
+import com.stripe.model.EventDataObjectDeserializer
+import com.stripe.model.HasId
+import kotlin.jvm.optionals.getOrNull
+import wepromise.api.commons.domain.EventId
+import wepromise.commons.json.parseJson
+import wepromise.commons.json.toJson
+
+
+class StripeEventId private constructor(value: String) : StripeObjectId(value), EventId {
+    companion object {
+        @JvmStatic
+        @JsonCreator
+        fun parse(s: String) = s.trim().let {
+            require(s.startsWith("$PREFIX:")) { "Invalid StripeEventId: $it" }
+            with(s.removePrefix("$PREFIX:"))
+        }
+
+        fun with(s: String) = s.trim().let {
+            require(it.startsWith("evt_")) { "Invalid Stripe Event ID: $it" }
+            StripeEventId(it)
+        }
+    }
+}
+
+// FIXME: write unit test for this!
+data class StripeEvent(
+    val id: StripeEventId,
+    val type: String,
+    val created: Long,
+    val dataObjectId: StripeObjectId?,
+    val rawJson: String,
+) {
+    companion object {
+        fun from(e: Event, json: String) = StripeEvent(
+            id = StripeEventId.with(e.id),
+            type = e.type,
+            created = e.created,
+            dataObjectId = e.dataObjectDeserializer.objectId,
+            rawJson = json.parseJson<Map<String, Any>>().toJson(), // round-trip to remove nulls!
+        )
+    }
+}
+
+@OptIn(ExperimentalStdlibApi::class)
+val EventDataObjectDeserializer.objectId: StripeObjectId?
+    get() = (getObject().getOrNull() as? HasId)?.let { StripeObjectId.from(it.id) }
+
+interface StripeEventRepository {
+    fun insert(e: StripeEvent)
+}
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/StripeService.kt:
+package wepromise.application.finance.stripe
+
+import com.fasterxml.jackson.core.JsonProcessingException
+import com.stripe.Stripe
+import com.stripe.model.Charge
+import com.stripe.model.Event
+import com.stripe.model.PaymentIntent
+import com.stripe.model.StripeObject
+import com.stripe.param.PaymentIntentCreateParams
+import com.stripe.param.PaymentIntentCreateParams.AutomaticPaymentMethods
+import java.time.Instant
+import org.joda.money.CurrencyUnit
+import org.joda.money.Money
+import org.springframework.stereotype.Service
+import wepromise.api.commons.domain.DomainId
+import wepromise.api.commons.domain.FlowId
+import wepromise.api.commons.domain.commons.Name
+import wepromise.api.commons.domain.commons.PersonName
+import wepromise.api.finance.payment.CanceledTransaction
+import wepromise.api.finance.payment.FailedTransaction
+import wepromise.api.finance.payment.PaymentId
+import wepromise.api.finance.payment.StartedTransaction
+import wepromise.api.finance.payment.SucceededTransaction
+import wepromise.api.finance.payment.SucceededTransaction.BillingDetails
+import wepromise.api.finance.payment.Transaction
+import wepromise.application.commons.event.EventCmdRequest
+import wepromise.application.finance.payment.CreatePaymentTransactionReq
+import wepromise.application.finance.payment.CreatePaymentTransactionRes
+import wepromise.application.finance.payment.ExternalTransactionUpdatedEvent
+import wepromise.application.finance.payment.PaymentEventCmdHandler
+import wepromise.application.finance.payment.TransactionService
+import wepromise.application.finance.stripe.aws.StripeEventDdbRepository
+import wepromise.commons.Locale
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.commons.StringExtensions.trimToNull
+import wepromise.commons.address.Address
+import wepromise.commons.json.deepCopyToMutableMap
+import wepromise.commons.json.parseJson
+import wepromise.commons.json.toJson
+import wepromise.commons.mail.EmailAddress
+import wepromise.commons.mail.EmailDestination
+import wepromise.commons.money.MoneyExtensions.currency
+import wepromise.commons.money.MoneyExtensions.payableAmount
+import wepromise.commons.time.Time.nowMillisInstant
+
+// FIXME: make this an enum!
+private const val PAYMENT_INTENT_CREATED = "payment_intent.created"
+private const val PAYMENT_INTENT_REQUIRES_ACTION = "payment_intent.requires_action"
+private const val PAYMENT_INTENT_PROCESSING = "payment_intent.processing"
+private const val PAYMENT_INTENT_SUCCEEDED = "payment_intent.succeeded"
+private const val PAYMENT_INTENT_PARTIALLY_FUNDED = "payment_intent.partially_funded"
+private const val PAYMENT_INTENT_PAYMENT_FAILED = "payment_intent.payment_failed"
+private const val PAYMENT_INTENT_PAYMENT_CANCELED = "payment_intent.canceled"
+
+data class HandleWebhookEventReq(
+    val signature: String,
+    val payload: String,
+)
+
+data class PaymentIntentMetadata(
+    val flowId: FlowId,
+    val paymentId: PaymentId,
+    val orderId: DomainId,
+    // FIXME: is this correct? where to put the reference?
+    val reference: String,
+) {
+    @Suppress("UNCHECKED_CAST")
+    fun toMutableMap() = deepCopyToMutableMap() as Map<String, String>
+
+    companion object {
+        fun from(r: CreatePaymentTransactionReq) =
+            PaymentIntentMetadata(r.flowId, r.paymentId, r.orderId, r.reference)
+    }
+}
+
+interface StripeService : TransactionService {
+    fun handleWebhookEvent(r: HandleWebhookEventReq)
+}
+
+@Service
+internal class StripeServiceImpl(
+    private val client: StripeClient,
+    private val events: StripeEventDdbRepository,
+    private val paymentCmdHandler: PaymentEventCmdHandler,
+) : StripeService {
+    private val log = logger()
+
+    // FIXME: generally it should fail if it cannot handle the event!
+    // FIXME: Also it should handle it via a SQS message to be able to retry and save in a DLQ?
+    override fun handleWebhookEvent(r: HandleWebhookEventReq) {
+        // How to deal with missing request ID?
+        log.info("Received webhook from Stripe: {}", r.payload.parseJson<Any>().toJson())
+        val event = client.constructWebhookEvent(r.payload, r.signature)
+        events.insert(StripeEvent.from(event, r.payload))
+
+        when {
+            event.type.startsWith("payment_intent.") -> handlePaymentIntentEvent(event)
+            else -> log.warn("Unhandled event type: {}", event.type)
+        }
+    }
+
+    private fun handlePaymentIntentEvent(event: Event) {
+        val obj = deserializeStripeObject(event) as? PaymentIntent
+            ?: throw IllegalArgumentException("Expected PaymentIntent, got ${event.rawJsonObject}")
+        log.info("Event {} {} for {}", event.type, obj.id, obj.metadata)
+
+        try {
+            val eventId = StripeEventId.with(event.id)
+            val metadata = obj.metadata.toJson().parseJson<PaymentIntentMetadata>()
+            val ee = ExternalTransactionUpdatedEvent(metadata.paymentId, toTransaction(event, obj))
+            paymentCmdHandler.handle(EventCmdRequest(eventId, metadata.flowId, ee, event.deepCopyToMutableMap()))
+        } catch (e: JsonProcessingException) {
+            log.warn("Failed to deserialize PaymentIntent metadata of {}: {}", obj.id, e.toString(), e)
+            return
+        }
+    }
+
+    private fun deserializeStripeObject(event: Event): StripeObject? =
+        event.dataObjectDeserializer.getObject().orElseGet {
+            val reason = if (Stripe.API_VERSION == event.apiVersion) "some json parsing error!"
+            else "mismatched API version: library: ${Stripe.API_VERSION}, event: ${event.apiVersion}"
+            log.warn("Failed to deserialize data object of event {} due to {}", event.id, reason)
+            null
+        }
+
+    private fun toTransaction(e: Event, pi: PaymentIntent): Transaction {
+        val startedTransaction = newStartedTransaction(pi)
+        return when (e.type) {
+            // FIXME: should we consider obj.status?
+            PAYMENT_INTENT_CREATED -> startedTransaction
+            PAYMENT_INTENT_REQUIRES_ACTION -> startedTransaction // FIXME: is this correct?
+            PAYMENT_INTENT_PROCESSING -> startedTransaction // FIXME: is this correct?
+
+            PAYMENT_INTENT_PAYMENT_FAILED ->
+                // FIXME: what is the correct way to get failedAt?
+                FailedTransaction.from(startedTransaction, failedAt = nowMillisInstant())
+
+            PAYMENT_INTENT_PAYMENT_CANCELED -> {
+                CanceledTransaction.from(startedTransaction, canceledAt = Instant.ofEpochSecond(pi.canceledAt))
+            }
+
+            PAYMENT_INTENT_SUCCEEDED -> {
+                val charge = pi.retrieveLatestSucceededCharge()
+                val billing = charge.billingDetails
+                val name = requireNotNull(billing.name.trimToNull()) { "Charge ${pi.id} has no name" }
+                val email = requireNotNull(billing.email.trimToNull()) { "Charge ${pi.id} has no email" }
+                val billingDetails = BillingDetails(
+                    PersonName.FullName(Name(name)),
+                    EmailAddress.from(EmailDestination.parse(email).address),
+                    Address(
+                        Locale.CountryCode.from(billing.address.country),
+                        billing.address.city,
+                        billing.address.line1,
+                        billing.address.line2,
+                        billing.address.postalCode
+                    ),
+                )
+                SucceededTransaction.from(
+                    prev = startedTransaction,
+                    amountReceived = pi.amountReceived,
+                    billing = billingDetails,
+                    succeededAt = nowMillisInstant(), // FIXME: what is the correct way?
+                )
+            }
+
+            else -> throw IllegalStateException("Unexpected event type: ${e.type}")
+        }
+    }
+
+    private fun newStartedTransaction(pi: PaymentIntent) = StartedTransaction(
+        id = StripePaymentIntentId.from(pi.id).toTransactionId(),
+        amountRequested = pi.amount,
+        amountReceived = pi.amountReceived,
+        currency = CurrencyUnit.of(pi.currency.uppercase()),
+        clientToken = pi.clientSecret,
+        startedAt = Instant.ofEpochSecond(pi.created),
+    )
+
+    // FIXME: implement timeout for the payment intent!
+    override fun createPaymentTransaction(r: CreatePaymentTransactionReq): CreatePaymentTransactionRes {
+        log.info("Creating payment transaction: {}", r)
+
+        // FIXME: set reference to the payment intent in the metadata!
+        val apm = AutomaticPaymentMethods.builder().setEnabled(true).build()
+        val params = PaymentIntentCreateParams.builder()
+            .setDescription(r.description)
+            .setAmount(r.amount)
+            .putAllMetadata(PaymentIntentMetadata.from(r).toMutableMap())
+            .setAutomaticPaymentMethods(apm)
+            .setDescription("Your WeatherPromise Purchase ${r.reference}") // FIXME: ask for a copy!
+            .setStatementDescriptorSuffix(r.reference)
+            .build()
+
+        // FIXME: what about idempotency key?
+        val pi = client.createPaymentIntent(params)
+        return CreatePaymentTransactionRes(newStartedTransaction(pi))
+    }
+
+    private fun PaymentIntent.retrieveLatestSucceededCharge(): Charge {
+        // FIXME: Why is it null? How to make charge object expanded in webhook?
+        val charge = latestChargeObject ?: client.retrieveCharge(StripeChargeId.from(latestCharge))
+        check(charge.paymentIntent == id) { "Charge ${charge.id} does not belong to PaymentIntent ${id}" }
+        check(charge.status == "succeeded") { "Charge status is not succeeded: ${charge.status}" }
+        return charge // If not originally expanded, the charge object is not saved in DB!
+    }
+
+    private fun PaymentIntentCreateParams.Builder.setAmount(amount: Money): PaymentIntentCreateParams.Builder {
+        setAmount(amount.payableAmount.unscaledValue().longValueExact())
+        setCurrency(amount.currency.code)
+        return this
+    }
+}
+
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/StripeDomain.kt:
+package wepromise.application.finance.stripe
+
+import com.fasterxml.jackson.annotation.JsonCreator
+import wepromise.api.commons.domain.EventId
+import wepromise.api.commons.domain.PrefixStrId
+import wepromise.api.finance.payment.TransactionId
+
+
+// FIXME:
+// 1. Apparently, the prefixes in IDs are not part of the API!
+
+const val PREFIX = "stripe"
+
+open class StripeObjectId internal constructor(value: String) : PrefixStrId(PREFIX, value), EventId {
+    companion object {
+        @JvmStatic
+        @JsonCreator
+        fun parse(s: String) = s.trim().let {
+            require(s.startsWith("$PREFIX:")) { "Invalid StripeObjectId: $it" }
+            from(s)
+        }
+
+        fun from(s: String) = StripeObjectId(s.removePrefix("$PREFIX:"))
+    }
+}
+
+// FIXME: If add TransactionId interface, the deserialization fails! Why?
+class StripePaymentIntentId private constructor(value: String) : StripeObjectId(value) /*, TransactionId */ {
+
+    // FIXME: remove me when TransactionId interface is added!
+    fun toTransactionId(): TransactionId = TransactionId.from(toJsonString())
+
+    companion object {
+        @JvmStatic
+        @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
+        fun parse(s: String) = from(StripeObjectId.parse(s))
+        fun from(s: String) = StripePaymentIntentId(s.removePrefix("$PREFIX:"))
+        fun from(id: StripeObjectId) = StripePaymentIntentId(id.value)
+        fun from(id: TransactionId) = parse(id.toJsonString())
+    }
+}
+
+class StripeChargeId private constructor(value: String) : StripeObjectId(value) {
+    companion object {
+        @JvmStatic
+        @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
+        fun parse(s: String) = from(StripeObjectId.parse(s))
+        fun from(s: String) = StripeChargeId(s.removePrefix("$PREFIX:"))
+        fun from(id: StripeObjectId) = StripeChargeId(id.value)
+    }
+}
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/http/v1/StripeController.kt:
+package wepromise.application.finance.stripe.http.v1
+
+import wepromise.api.commons.http.CommonHeaders.STRIPE_SIGNATURE as SIGNATURE
+import jakarta.servlet.http.HttpServletRequest
+import org.springframework.http.HttpHeaders
+import org.springframework.http.HttpStatus
+import org.springframework.web.bind.annotation.PostMapping
+import org.springframework.web.bind.annotation.RequestBody
+import org.springframework.web.bind.annotation.RequestHeader
+import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.ResponseStatus
+import org.springframework.web.bind.annotation.RestController
+import wepromise.application.finance.stripe.HandleWebhookEventReq
+import wepromise.application.finance.stripe.StripeService
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.configuration.PaymentAutoConfiguration.Companion.STRIPE_BASE_URL
+
+
+@RestController
+@RequestMapping(STRIPE_BASE_URL)
+class StripeController(private val stripe: StripeService) {
+    private val log = logger()
+
+    @PostMapping("/webhook")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    fun handle(
+        @RequestHeader(SIGNATURE) signature: String,
+        @RequestHeader h: HttpHeaders,
+        @RequestBody b: String,
+        r: HttpServletRequest
+    ) {
+        try {
+            // FIXME: how to use request.id and request.idempotency_key
+            stripe.handleWebhookEvent(HandleWebhookEventReq(signature, b))
+        } catch (e: Exception) {
+            log.error("Error while processing webhook", e)
+            throw e
+        }
+    }
+}
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/aws/StripeEventDdbRepository.kt:
+package wepromise.application.finance.stripe.aws
+
+import software.amazon.awssdk.enhanced.dynamodb.AttributeConverter
+import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primarySortKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.secondaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticTableSchema
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbBean
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbConvertedBy
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbSecondaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbSecondarySortKey
+import wepromise.application.finance.stripe.StripeEvent
+import wepromise.application.finance.stripe.StripeEventId
+import wepromise.application.finance.stripe.StripeEventRepository
+import wepromise.application.finance.stripe.StripeObjectId
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.commons.aws.ddb.FromStringAttributeConverter
+
+// FIXME:
+//  1. Make this immutable
+//  3. Write integration test
+@DynamoDbBean
+data class StripeEventDdbEntity(
+
+    @get:DynamoDbPartitionKey
+    @get:DynamoDbConvertedBy(StripeEventIdConverter::class)
+    @get:DynamoDbSecondarySortKey(indexNames = ["id-index"])
+    var eid: StripeEventId = StripeEventId.with("evt_null"),
+
+    @get:DynamoDbConvertedBy(StripeObjectIdConverter::class)
+    @get:DynamoDbSecondaryPartitionKey(indexNames = ["id-index"])
+    var oid: StripeObjectId? = null, // nullable
+
+    var type: String = "",
+
+    var createdAt: Long = 0,
+
+    var payload: String = "{}", // JSON string
+)
+
+class StripeEventDdbRepository(props: Properties, client: DynamoDbEnhancedClient) : StripeEventRepository {
+    private val log = logger()
+
+    private val schema = tableSchema() // TableSchema.fromBean is not NativeImage friendly!
+    private val table = client.table(props.table, schema)
+
+    // FIXME: unit test for the converter
+    override fun insert(e: StripeEvent) {
+        insert(
+            StripeEventDdbEntity(
+                eid = e.id,
+                oid = e.dataObjectId,
+                createdAt = e.created,
+                type = e.type,
+                payload = e.rawJson,
+            )
+        )
+    }
+
+    // FIXME: check if the item doesn't already exist!
+    // What to do if it exists? Update? Throw an exception?
+    private fun insert(e: StripeEventDdbEntity) {
+        log.info("Saving {}", e)
+        table.putItem(e)
+    }
+
+    data class Properties(val table: String)
+}
+
+private fun tableSchema(): StaticTableSchema<StripeEventDdbEntity> {
+    return StaticTableSchema.builder(StripeEventDdbEntity::class.java)
+        .newItemSupplier(::StripeEventDdbEntity)
+        .addAttribute(StripeEventId::class.java) {
+            it.name("eid")
+                .getter(StripeEventDdbEntity::eid.getter)
+                .setter(StripeEventDdbEntity::eid.setter)
+                .tags(primaryPartitionKey())
+                .attributeConverter(StripeEventIdConverter())
+        }
+        .addAttribute(StripeObjectId::class.java) {
+            it.name("oid")
+                .getter(StripeEventDdbEntity::oid.getter)
+                .setter(StripeEventDdbEntity::oid.setter)
+                .tags(primarySortKey(), secondaryPartitionKey("id-index"))
+                .attributeConverter(StripeObjectIdConverter())
+        }
+        .addAttribute(String::class.java) {
+            it.name("type")
+                .getter(StripeEventDdbEntity::type.getter)
+                .setter(StripeEventDdbEntity::type.setter)
+        }
+        .addAttribute(Long::class.java) {
+            it.name("createdAt")
+                .getter(StripeEventDdbEntity::createdAt.getter)
+                .setter(StripeEventDdbEntity::createdAt.setter)
+        }
+        .addAttribute(String::class.java) {
+            it.name("payload")
+                .getter(StripeEventDdbEntity::payload.getter)
+                .setter(StripeEventDdbEntity::payload.setter)
+        }
+        .build()
+}
+
+class StripeObjectIdConverter : AttributeConverter<StripeObjectId> by
+FromStringAttributeConverter.with(StripeObjectId::toJsonString, StripeObjectId::parse)
+
+class StripeEventIdConverter : AttributeConverter<StripeEventId> by
+FromStringAttributeConverter.with(StripeEventId::toJsonString, StripeEventId::parse)
+
+
+-----
+

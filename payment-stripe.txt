@@ -1,0 +1,574 @@
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/StripeClient.kt:
+package wepromise.application.finance.stripe
+
+import com.stripe.Stripe
+import com.stripe.model.Charge
+import com.stripe.model.Event
+import com.stripe.model.PaymentIntent
+import com.stripe.net.ApiResource
+import com.stripe.net.Webhook
+import com.stripe.param.PaymentIntentCreateParams
+import com.stripe.param.PaymentIntentRetrieveParams
+import java.net.URL
+import wepromise.api.commons.domain.Secret
+import wepromise.commons.LoggerExtensions.logger
+
+private const val TOLERANCE: Long = 300
+
+fun interface StripeSignatureVerifier {
+    fun verify(payload: String, signature: String) // throws SignatureVerificationException
+
+    companion object {
+        private val log = logger()
+
+        @JvmStatic
+        fun withWebhookSecret(secret: String) = StripeSignatureVerifier { p, s ->
+            Webhook.Signature.verifyHeader(p, s, secret, TOLERANCE)
+        }
+
+        @JvmStatic
+        fun noop() = StripeSignatureVerifier { _, _ -> log.warn("Skipping signature verification!") }
+    }
+}
+
+interface StripeClient {
+    fun createPaymentIntent(params: PaymentIntentCreateParams): PaymentIntent
+    fun retrievePaymentIntent(id: StripePaymentIntentId): PaymentIntent
+    fun retrieveCharge(id: StripeChargeId): Charge
+    fun constructWebhookEvent(payload: String, signature: String): Event
+
+    companion object {
+        @JvmStatic
+        fun create(apiBase: URL, apiKey: Secret, verifier: StripeSignatureVerifier): StripeClient {
+            return StripeClientImpl(apiBase, apiKey.value, verifier)
+        }
+    }
+}
+
+internal class StripeClientImpl(
+    apiBase: URL,
+    apiKey: String,
+    private val verifier: StripeSignatureVerifier,
+) : StripeClient {
+
+    init {
+        Stripe.apiKey = apiKey
+        Stripe.overrideApiBase(apiBase.toString())
+    }
+
+    override fun createPaymentIntent(params: PaymentIntentCreateParams): PaymentIntent {
+        return PaymentIntent.create(params)
+    }
+
+    override fun retrievePaymentIntent(id: StripePaymentIntentId): PaymentIntent {
+        val params = PaymentIntentRetrieveParams.builder().addExpand("latest_charge").build()
+        return PaymentIntent.retrieve(id.value, params, null)
+    }
+
+    override fun retrieveCharge(id: StripeChargeId): Charge {
+        return Charge.retrieve(id.value)
+    }
+
+    override fun constructWebhookEvent(payload: String, signature: String): Event {
+        verifier.verify(payload, signature)
+        return ApiResource.GSON.fromJson(payload, Event::class.java)
+    }
+
+}
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/StripeEvent.kt:
+package wepromise.application.finance.stripe
+
+import com.fasterxml.jackson.annotation.JsonCreator
+import com.stripe.model.Event
+import com.stripe.model.EventDataObjectDeserializer
+import com.stripe.model.HasId
+import kotlin.jvm.optionals.getOrNull
+import wepromise.api.commons.domain.EventId
+import wepromise.commons.json.parseJson
+import wepromise.commons.json.toJson
+
+
+class StripeEventId private constructor(value: String) : StripeObjectId(value), EventId {
+    companion object {
+        @JvmStatic
+        @JsonCreator
+        fun parse(s: String) = s.trim().let {
+            require(s.startsWith("$PREFIX:")) { "Invalid StripeEventId: $it" }
+            with(s.removePrefix("$PREFIX:"))
+        }
+
+        fun with(s: String) = s.trim().let {
+            require(it.startsWith("evt_")) { "Invalid Stripe Event ID: $it" }
+            StripeEventId(it)
+        }
+    }
+}
+
+// FIXME: write unit test for this!
+data class StripeEvent(
+    val id: StripeEventId,
+    val type: String,
+    val created: Long,
+    val dataObjectId: StripeObjectId?,
+    val rawJson: String,
+) {
+    companion object {
+        fun from(e: Event, json: String) = StripeEvent(
+            id = StripeEventId.with(e.id),
+            type = e.type,
+            created = e.created,
+            dataObjectId = e.dataObjectDeserializer.objectId,
+            rawJson = json.parseJson<Map<String, Any>>().toJson(), // round-trip to remove nulls!
+        )
+    }
+}
+
+@OptIn(ExperimentalStdlibApi::class)
+val EventDataObjectDeserializer.objectId: StripeObjectId?
+    get() = (getObject().getOrNull() as? HasId)?.let { StripeObjectId.from(it.id) }
+
+interface StripeEventRepository {
+    fun insert(e: StripeEvent)
+}
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/StripeService.kt:
+package wepromise.application.finance.stripe
+
+import com.fasterxml.jackson.core.JsonProcessingException
+import com.stripe.Stripe
+import com.stripe.model.Charge
+import com.stripe.model.Event
+import com.stripe.model.PaymentIntent
+import com.stripe.model.StripeObject
+import com.stripe.param.PaymentIntentCreateParams
+import com.stripe.param.PaymentIntentCreateParams.AutomaticPaymentMethods
+import java.time.Instant
+import org.joda.money.CurrencyUnit
+import org.joda.money.Money
+import org.springframework.stereotype.Service
+import wepromise.api.commons.domain.DomainId
+import wepromise.api.commons.domain.FlowId
+import wepromise.api.commons.domain.commons.PersonName
+import wepromise.api.finance.payment.CanceledTransaction
+import wepromise.api.finance.payment.FailedTransaction
+import wepromise.api.finance.payment.PaymentId
+import wepromise.api.finance.payment.StartedTransaction
+import wepromise.api.finance.payment.SucceededTransaction
+import wepromise.api.finance.payment.SucceededTransaction.BillingDetails
+import wepromise.api.finance.payment.Transaction
+import wepromise.application.commons.event.EventCmdRequest
+import wepromise.application.finance.payment.CreatePaymentTransactionReq
+import wepromise.application.finance.payment.CreatePaymentTransactionRes
+import wepromise.application.finance.payment.ExternalTransactionUpdatedEvent
+import wepromise.application.finance.payment.PaymentEventCmdHandler
+import wepromise.application.finance.payment.TransactionService
+import wepromise.application.finance.stripe.aws.StripeEventDdbRepository
+import wepromise.commons.Locale
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.commons.StringExtensions.trimToNull
+import wepromise.commons.address.Address
+import wepromise.commons.json.deepCopyToMutableMap
+import wepromise.commons.json.parseJson
+import wepromise.commons.json.toJson
+import wepromise.commons.mail.EmailAddress
+import wepromise.commons.mail.EmailDestination
+import wepromise.commons.money.MoneyExtensions.currency
+import wepromise.commons.money.MoneyExtensions.payableAmount
+import wepromise.commons.time.Time.nowMillisInstant
+
+// FIXME: make this an enum!
+private const val PAYMENT_INTENT_CREATED = "payment_intent.created"
+private const val PAYMENT_INTENT_REQUIRES_ACTION = "payment_intent.requires_action"
+private const val PAYMENT_INTENT_PROCESSING = "payment_intent.processing"
+private const val PAYMENT_INTENT_SUCCEEDED = "payment_intent.succeeded"
+private const val PAYMENT_INTENT_PARTIALLY_FUNDED = "payment_intent.partially_funded"
+private const val PAYMENT_INTENT_PAYMENT_FAILED = "payment_intent.payment_failed"
+private const val PAYMENT_INTENT_PAYMENT_CANCELED = "payment_intent.canceled"
+
+data class HandleWebhookEventReq(
+    val signature: String,
+    val payload: String,
+)
+
+data class PaymentIntentMetadata(
+    val flowId: FlowId,
+    val paymentId: PaymentId,
+    val orderId: DomainId,
+    // FIXME: is this correct? where to put the reference?
+    val reference: String,
+) {
+    @Suppress("UNCHECKED_CAST")
+    fun toMutableMap() = deepCopyToMutableMap() as Map<String, String>
+
+    companion object {
+        fun from(r: CreatePaymentTransactionReq) =
+            PaymentIntentMetadata(r.flowId, r.paymentId, r.orderId, r.reference)
+    }
+}
+
+interface StripeService : TransactionService {
+    fun handleWebhookEvent(r: HandleWebhookEventReq)
+}
+
+@Service
+internal class StripeServiceImpl(
+    private val client: StripeClient,
+    private val events: StripeEventDdbRepository,
+    private val paymentCmdHandler: PaymentEventCmdHandler,
+) : StripeService {
+    private val log = logger()
+
+    // FIXME: generally it should fail if it cannot handle the event!
+    // FIXME: Also it should handle it via a SQS message to be able to retry and save in a DLQ?
+    override fun handleWebhookEvent(r: HandleWebhookEventReq) {
+        log.info("Received webhook from Stripe: {}", r.payload.parseJson<Any>().toJson())
+        val event = client.constructWebhookEvent(r.payload, r.signature)
+        events.insert(StripeEvent.from(event, r.payload))
+
+        when {
+            event.type.startsWith("payment_intent.") -> handlePaymentIntentEvent(event)
+            else -> log.warn("Unhandled event type: {}", event.type)
+        }
+    }
+
+    private fun handlePaymentIntentEvent(event: Event) {
+        val obj = deserializeStripeObject(event) as? PaymentIntent
+            ?: throw IllegalArgumentException("Expected PaymentIntent, got ${event.rawJsonObject}")
+        log.info("Event {} {} for {}", event.type, obj.id, obj.metadata)
+
+        try {
+            val eventId = StripeEventId.with(event.id)
+            val metadata = obj.metadata.toJson().parseJson<PaymentIntentMetadata>()
+            val ee = ExternalTransactionUpdatedEvent(metadata.paymentId, toTransaction(event, obj))
+            paymentCmdHandler.handle(EventCmdRequest(eventId, metadata.flowId, ee, event.deepCopyToMutableMap()))
+        } catch (e: JsonProcessingException) {
+            log.warn("Failed to deserialize PaymentIntent metadata of {}: {}", obj.id, e.toString(), e)
+            return
+        }
+    }
+
+    private fun deserializeStripeObject(event: Event): StripeObject? =
+        event.dataObjectDeserializer.getObject().orElseGet {
+            val reason = if (Stripe.API_VERSION == event.apiVersion) "some json parsing error!"
+            else "mismatched API version: library: ${Stripe.API_VERSION}, event: ${event.apiVersion}"
+            log.warn("Failed to deserialize data object of event {} due to {}", event.id, reason)
+            null
+        }
+
+    private fun toTransaction(e: Event, pi: PaymentIntent): Transaction {
+        val startedTransaction = newStartedTransaction(pi)
+        return when (e.type) {
+            // FIXME: should we consider obj.status?
+            PAYMENT_INTENT_CREATED -> startedTransaction
+            PAYMENT_INTENT_REQUIRES_ACTION -> startedTransaction // FIXME: is this correct?
+            PAYMENT_INTENT_PROCESSING -> startedTransaction // FIXME: is this correct?
+
+            PAYMENT_INTENT_PAYMENT_FAILED ->
+                // FIXME: what is the correct way to get failedAt?
+                FailedTransaction.from(startedTransaction, failedAt = nowMillisInstant())
+
+            PAYMENT_INTENT_PAYMENT_CANCELED -> {
+                CanceledTransaction.from(startedTransaction, canceledAt = Instant.ofEpochSecond(pi.canceledAt))
+            }
+
+            PAYMENT_INTENT_SUCCEEDED -> {
+                val charge = pi.retrieveLatestSucceededCharge()
+                val billing = charge.billingDetails
+                val email = requireNotNull(billing.email.trimToNull()) { "Charge ${pi.id} has no email" }
+                val name = requireNotNull(billing.name.trimToNull()) { "Charge ${pi.id} has no name" }
+                val billingDetails = BillingDetails(
+                    email = EmailAddress.from(EmailDestination.parse(email).address),
+                    name = when (name.indexOf(',')) {
+                        -1 -> PersonName.fullname(name)
+                        else -> PersonName.parseLastCommaFirst(name)
+                    },
+                    address = Address(
+                        Locale.CountryCode.from(billing.address.country),
+                        billing.address.city,
+                        billing.address.line1,
+                        billing.address.line2,
+                        billing.address.postalCode
+                    ),
+                )
+                SucceededTransaction.from(
+                    prev = startedTransaction,
+                    amountReceived = pi.amountReceived,
+                    billing = billingDetails,
+                    succeededAt = nowMillisInstant(), // FIXME: what is the correct way?
+                )
+            }
+
+            else -> throw IllegalStateException("Unexpected event type: ${e.type}")
+        }
+    }
+
+    private fun newStartedTransaction(pi: PaymentIntent) = StartedTransaction(
+        id = StripePaymentIntentId.from(pi.id).toTransactionId(),
+        amountRequested = pi.amount,
+        amountReceived = pi.amountReceived,
+        currency = CurrencyUnit.of(pi.currency.uppercase()),
+        clientToken = pi.clientSecret,
+        startedAt = Instant.ofEpochSecond(pi.created),
+    )
+
+    // FIXME: implement timeout for the payment intent!
+    override fun createPaymentTransaction(r: CreatePaymentTransactionReq): CreatePaymentTransactionRes {
+        log.info("Creating payment transaction: {}", r)
+
+        // FIXME: set reference to the payment intent in the metadata!
+        val apm = AutomaticPaymentMethods.builder().setEnabled(true).build()
+        val params = PaymentIntentCreateParams.builder()
+            .setDescription(r.description)
+            .setAmount(r.amount)
+            .putAllMetadata(PaymentIntentMetadata.from(r).toMutableMap())
+            .setAutomaticPaymentMethods(apm)
+            .setDescription("Your WeatherPromise Purchase ${r.reference}") // FIXME: ask for a copy!
+            .setStatementDescriptorSuffix(r.reference)
+            .build()
+
+        // FIXME: what about idempotency key?
+        val pi = client.createPaymentIntent(params)
+        return CreatePaymentTransactionRes(newStartedTransaction(pi))
+    }
+
+    private fun PaymentIntent.retrieveLatestSucceededCharge(): Charge {
+        // FIXME: Why is it null? How to make charge object expanded in webhook?
+        val charge = latestChargeObject ?: client.retrieveCharge(StripeChargeId.from(latestCharge))
+        check(charge.paymentIntent == id) { "Charge ${charge.id} does not belong to PaymentIntent ${id}" }
+        check(charge.status == "succeeded") { "Charge status is not succeeded: ${charge.status}" }
+        return charge // If not originally expanded, the charge object is not saved in DB!
+    }
+
+    private fun PaymentIntentCreateParams.Builder.setAmount(amount: Money): PaymentIntentCreateParams.Builder {
+        setAmount(amount.payableAmount.unscaledValue().longValueExact())
+        setCurrency(amount.currency.code)
+        return this
+    }
+}
+
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/StripeDomain.kt:
+package wepromise.application.finance.stripe
+
+import com.fasterxml.jackson.annotation.JsonCreator
+import wepromise.api.commons.domain.EventId
+import wepromise.api.commons.domain.PrefixStrId
+import wepromise.api.finance.payment.TransactionId
+
+
+// FIXME:
+// 1. Apparently, the prefixes in IDs are not part of the API!
+
+const val PREFIX = "stripe"
+
+open class StripeObjectId internal constructor(value: String) : PrefixStrId(PREFIX, value), EventId {
+    companion object {
+        @JvmStatic
+        @JsonCreator
+        fun parse(s: String) = s.trim().let {
+            require(s.startsWith("$PREFIX:")) { "Invalid StripeObjectId: $it" }
+            from(s)
+        }
+
+        fun from(s: String) = StripeObjectId(s.removePrefix("$PREFIX:"))
+    }
+}
+
+// FIXME: If add TransactionId interface, the deserialization fails! Why?
+class StripePaymentIntentId private constructor(value: String) : StripeObjectId(value) /*, TransactionId */ {
+
+    // FIXME: remove me when TransactionId interface is added!
+    fun toTransactionId(): TransactionId = TransactionId.from(toJsonString())
+
+    companion object {
+        @JvmStatic
+        @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
+        fun parse(s: String) = from(StripeObjectId.parse(s))
+        fun from(s: String) = StripePaymentIntentId(s.removePrefix("$PREFIX:"))
+        fun from(id: StripeObjectId) = StripePaymentIntentId(id.value)
+        fun from(id: TransactionId) = parse(id.toJsonString())
+    }
+}
+
+class StripeChargeId private constructor(value: String) : StripeObjectId(value) {
+    companion object {
+        @JvmStatic
+        @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
+        fun parse(s: String) = from(StripeObjectId.parse(s))
+        fun from(s: String) = StripeChargeId(s.removePrefix("$PREFIX:"))
+        fun from(id: StripeObjectId) = StripeChargeId(id.value)
+    }
+}
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/http/v1/StripeController.kt:
+package wepromise.application.finance.stripe.http.v1
+
+import wepromise.api.commons.http.CommonHeaders.STRIPE_SIGNATURE as SIGNATURE
+import jakarta.servlet.http.HttpServletRequest
+import org.springframework.http.HttpHeaders
+import org.springframework.http.HttpStatus
+import org.springframework.web.bind.annotation.PostMapping
+import org.springframework.web.bind.annotation.RequestBody
+import org.springframework.web.bind.annotation.RequestHeader
+import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.ResponseStatus
+import org.springframework.web.bind.annotation.RestController
+import wepromise.application.finance.stripe.HandleWebhookEventReq
+import wepromise.application.finance.stripe.StripeService
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.configuration.PaymentAutoConfiguration.Companion.STRIPE_BASE_URL
+
+
+@RestController
+@RequestMapping(STRIPE_BASE_URL)
+class StripeController(private val stripe: StripeService) {
+    private val log = logger()
+
+    @PostMapping("/webhook")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    fun handle(
+        @RequestHeader(SIGNATURE) signature: String,
+        @RequestHeader h: HttpHeaders,
+        @RequestBody b: String,
+        r: HttpServletRequest
+    ) {
+        try {
+            // FIXME: how to use request.id and request.idempotency_key
+            stripe.handleWebhookEvent(HandleWebhookEventReq(signature, b))
+        } catch (e: Exception) {
+            log.error("Error while processing webhook", e)
+            throw e
+        }
+    }
+}
+
+
+-----
+
+/Users/admin/wepromise/backend-service/code/src/main/kotlin/wepromise/application/finance/stripe/aws/StripeEventDdbRepository.kt:
+package wepromise.application.finance.stripe.aws
+
+import software.amazon.awssdk.enhanced.dynamodb.AttributeConverter
+import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.primarySortKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticAttributeTags.secondaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticTableSchema
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbBean
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbConvertedBy
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbSecondaryPartitionKey
+import software.amazon.awssdk.enhanced.dynamodb.mapper.annotations.DynamoDbSecondarySortKey
+import wepromise.application.finance.stripe.StripeEvent
+import wepromise.application.finance.stripe.StripeEventId
+import wepromise.application.finance.stripe.StripeEventRepository
+import wepromise.application.finance.stripe.StripeObjectId
+import wepromise.commons.LoggerExtensions.logger
+import wepromise.commons.aws.ddb.FromStringAttributeConverter
+
+// FIXME:
+//  1. Make this immutable
+//  3. Write integration test
+@DynamoDbBean
+data class StripeEventDdbEntity(
+
+    @get:DynamoDbPartitionKey
+    @get:DynamoDbConvertedBy(StripeEventIdConverter::class)
+    @get:DynamoDbSecondarySortKey(indexNames = ["id-index"])
+    var eid: StripeEventId = StripeEventId.with("evt_null"),
+
+    @get:DynamoDbConvertedBy(StripeObjectIdConverter::class)
+    @get:DynamoDbSecondaryPartitionKey(indexNames = ["id-index"])
+    var oid: StripeObjectId? = null, // nullable
+
+    var type: String = "",
+
+    var createdAt: Long = 0,
+
+    var payload: String = "{}", // JSON string
+)
+
+class StripeEventDdbRepository(props: Properties, client: DynamoDbEnhancedClient) : StripeEventRepository {
+    private val log = logger()
+
+    private val schema = tableSchema() // TableSchema.fromBean is not NativeImage friendly!
+    private val table = client.table(props.table, schema)
+
+    // FIXME: unit test for the converter
+    override fun insert(e: StripeEvent) {
+        insert(
+            StripeEventDdbEntity(
+                eid = e.id,
+                oid = e.dataObjectId,
+                createdAt = e.created,
+                type = e.type,
+                payload = e.rawJson,
+            )
+        )
+    }
+
+    // FIXME: check if the item doesn't already exist!
+    // What to do if it exists? Update? Throw an exception?
+    private fun insert(e: StripeEventDdbEntity) {
+        log.info("Saving {}", e)
+        table.putItem(e)
+    }
+
+    data class Properties(val table: String)
+}
+
+private fun tableSchema(): StaticTableSchema<StripeEventDdbEntity> {
+    return StaticTableSchema.builder(StripeEventDdbEntity::class.java)
+        .newItemSupplier(::StripeEventDdbEntity)
+        .addAttribute(StripeEventId::class.java) {
+            it.name("eid")
+                .getter(StripeEventDdbEntity::eid.getter)
+                .setter(StripeEventDdbEntity::eid.setter)
+                .tags(primaryPartitionKey())
+                .attributeConverter(StripeEventIdConverter())
+        }
+        .addAttribute(StripeObjectId::class.java) {
+            it.name("oid")
+                .getter(StripeEventDdbEntity::oid.getter)
+                .setter(StripeEventDdbEntity::oid.setter)
+                .tags(primarySortKey(), secondaryPartitionKey("id-index"))
+                .attributeConverter(StripeObjectIdConverter())
+        }
+        .addAttribute(String::class.java) {
+            it.name("type")
+                .getter(StripeEventDdbEntity::type.getter)
+                .setter(StripeEventDdbEntity::type.setter)
+        }
+        .addAttribute(Long::class.java) {
+            it.name("createdAt")
+                .getter(StripeEventDdbEntity::createdAt.getter)
+                .setter(StripeEventDdbEntity::createdAt.setter)
+        }
+        .addAttribute(String::class.java) {
+            it.name("payload")
+                .getter(StripeEventDdbEntity::payload.getter)
+                .setter(StripeEventDdbEntity::payload.setter)
+        }
+        .build()
+}
+
+class StripeObjectIdConverter : AttributeConverter<StripeObjectId> by
+FromStringAttributeConverter.with(StripeObjectId::toJsonString, StripeObjectId::parse)
+
+class StripeEventIdConverter : AttributeConverter<StripeEventId> by
+FromStringAttributeConverter.with(StripeEventId::toJsonString, StripeEventId::parse)
+
+
+-----
+
